@@ -160,65 +160,70 @@ class FileTransferClient:
                 return True
                 
             elif mode == "upload":
-                # Check if file exists
-                if not os.path.exists(filename):
-                    print("Error: File does not exist!")
-                    return False
-                
-                file_size = os.path.getsize(filename)
-                basename = os.path.basename(filename)
-                
-                # Send upload request
-                sock.sendto(f"UDP_UPLOAD {basename} {file_size}\n".encode(), (self.ip, self.port))
-                
-                # Wait for READY response
-                response, _ = sock.recvfrom(BUFFER_SIZE)
-                response = response.decode().strip()
-                
-                if "READY" not in response:
-                    print(f"Server error: {response}")
-                    return False
-                
-                seq = 0
-                retries = 0
-                
-                with open(filename, "rb") as file:
-                    while chunk := file.read(BUFFER_SIZE - 6):  # 4 bytes seq + 2 bytes length
-                        # Prepare packet
-                        header = struct.pack("!IH", seq, len(chunk))
-                        packet = header + chunk
-                        
-                        # Send with retries
-                        for attempt in range(MAX_RETRIES + 1):
-                            sock.sendto(packet, (self.ip, self.port))
+                try:
+                    if not os.path.exists(filename):
+                        print("Error: File does not exist!")
+                        return False
+                    
+                    file_size = os.path.getsize(filename)
+                    basename = os.path.basename(filename)
+                    start_time = time.time()
+                    transfered = 0
+                    
+                    # Send upload request
+                    sock.sendto(f"UDP_UPLOAD {basename} {file_size}\n".encode(), (self.ip, self.port))
+                    
+                    # Wait for READY response
+                    response, _ = sock.recvfrom(BUFFER_SIZE)
+                    if response.decode().strip() != "READY":
+                        print(f"Server error: {response.decode()}")
+                        return False
+                    
+                    seq = 0
+                    with open(filename, "rb") as file:
+                        while chunk := file.read(PAYLOAD_SIZE):
+                            header = struct.pack("!IH", seq, len(chunk))
+                            packet = header + chunk
                             
-                            try:
-                                ack, _ = sock.recvfrom(BUFFER_SIZE)
-                                ack = ack.decode().strip()
+                            # Send with retries
+                            for attempt in range(MAX_RETRIES + 1):
+                                sock.sendto(packet, (self.ip, self.port))
                                 
-                                if ack == f"ACK {seq}":
-                                    break
+                                try:
+                                    ack, _ = sock.recvfrom(BUFFER_SIZE)
+                                    ack = ack.decode().strip()
                                     
-                            except socket.timeout:
-                                if attempt == MAX_RETRIES:
-                                    print("\nMax retries reached, upload failed")
-                                    return False
-                                continue
-                        
-                        seq += 1
-                        print(f"\rUpload progress: {seq * (BUFFER_SIZE - 6) / file_size * 100:.1f}%", end="")
-                        transfered += len(chunk)
-                # Send end packet
-                end_packet = struct.pack("!IH", 0xFFFFFFFF, 0)
-                sock.sendto(end_packet, (self.ip, self.port))
-                duration = time.time() - start_time
-                bitrate = (transfered * 8) / duration
-                print(f"\nUpload completed successfully! Bitrate: {self.format_bitrate(bitrate)}")
-                return True
-                
-        except Exception as e:
-            print(f"\nTransfer failed: {str(e)}")
-            return False
+                                    if ack == f"ACK {seq}":
+                                        transfered += len(chunk)
+                                        break
+                                        
+                                except socket.timeout:
+                                    if attempt == MAX_RETRIES:
+                                        print("\nMax retries reached, upload failed")
+                                        return False
+                            
+                            seq += 1
+                            print(f"\rProgress: {file.tell()/file_size*100:.1f}%", end="", flush=True)
+                    
+                    # Send end packet and wait for confirmation
+                    end_packet = struct.pack("!IH", 0xFFFFFFFF, 0)
+                    sock.sendto(end_packet, (self.ip, self.port))
+                    
+                    try:
+                        ack, _ = sock.recvfrom(BUFFER_SIZE)
+                        if "ACK 4294967295" not in ack.decode().strip():
+                            print("\nWarning: Invalid final ACK")
+                    except socket.timeout:
+                        print("\nWarning: No final ACK received")
+                    
+                    duration = time.time() - start_time
+                    bitrate = (transfered * 8) / duration if duration > 0 else 0
+                    print(f"\nUpload complete! Bitrate: {self.format_bitrate(bitrate)}")
+                    return True
+                    
+                except Exception as e:
+                    print(f"\nTransfer failed: {str(e)}")
+                    return False
         finally:
             sock.close()
 
