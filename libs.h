@@ -26,15 +26,21 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <mutex>
+#include <csignal>
+#include "ThreadPool.cpp"
 
 #define TCP_PORT 8080
 #define UDP_PORT 8081
-#define BUFFER_SIZE 4096
+#define BUFFER_SIZE 1024
 
 //functions
 void initializeSockets();
 void cleanupSockets();
 void handleClient(int clientSocket);
 void handleUDPServer();
+int handleTCPServer(SOCKET serverSocket);
+int closeSockets(SOCKET serverSocket, int exitCode);
+void signal_handler(int);
 
 #endif//TCP_SERVER_LIBS_H
