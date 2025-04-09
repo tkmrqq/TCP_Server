@@ -1,4 +1,34 @@
-#include "libs.h"
+#include "../libs.h"
+
+volatile std::sig_atomic_t g_shutdown = 0;
+std::mutex accept_mutex;
+std::mutex log_mutex;
+
+// В структуре или глобально (лучше использовать класс)
+std::unordered_map<int, bool> clientUploadMode; // key: clientSocket, value: in upload mode
+std::unordered_map<int, int> clientFileSizes;   // Остаток байт для приёма
+std::unordered_map<int, std::string> clientFileName;
+static std::unordered_map<int, int> bytesReceivedMap;
+
+void signal_handler(int) {
+    g_shutdown = 1;
+    std::cout << "Detected SIGINT, closing server...";
+}
+
+void log_message(const std::string& msg) {
+    std::lock_guard<std::mutex> lock(log_mutex);
+    std::cout << "[LOG] " << msg << std::endl;
+}
+
+int closeSockets(SOCKET serverSocket, int exitCode){
+#ifdef _WIN32
+    closesocket(serverSocket);
+#else
+    close(serverSocket);
+#endif
+    cleanupSockets();
+    return exitCode;
+}
 
 void initializeSockets() {
 #ifdef _WIN32
@@ -40,6 +70,52 @@ void handleExit(int clientSocket) {
 #else
     close(clientSocket);
 #endif
+}
+
+int handleTCPServer(SOCKET serverSocket){
+    sockaddr_in serverAddr{};
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_addr.s_addr = INADDR_ANY;
+    serverAddr.sin_port = htons(TCP_PORT);
+
+    ThreadPool pool(4);
+
+    if (bind(serverSocket, (struct sockaddr *) &serverAddr, sizeof(serverAddr)) == -1) {
+        std::cerr << "Bind failed" << std::endl;
+        closeSockets(serverSocket, EXIT_FAILURE);
+    }
+
+    if (listen(serverSocket, 5) == -1) {
+        std::cerr << "Listen failed" << std::endl;
+        closeSockets(serverSocket, EXIT_FAILURE);
+    }
+
+    std::cout << "[TCP] Server listening on port " << TCP_PORT << "..." << std::endl;
+
+    while (!g_shutdown) {
+        sockaddr_in clientAddr;
+        socklen_t clientSize = sizeof(clientAddr);
+        std::lock_guard<std::mutex> lock(accept_mutex);
+        int clientSocket = accept(serverSocket, (struct sockaddr *) &clientAddr, &clientSize);
+        if (clientSocket == -1) {
+            //            if (errno == EWOULDBLOCK || errno == EAGAIN) {
+            //                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            //                continue;
+            //            }
+            std::cerr << "Accept failed" << std::endl;
+            break;
+        }
+
+        pool.enqueue([clientSocket] {
+            handleClient(clientSocket);
+        });
+
+        log_message("Client connected: " + std::string(inet_ntoa(clientAddr.sin_addr)));
+
+        //        std::thread clientThread(handleClient, clientSocket);
+        //        clientThread.detach();
+    }
+    return EXIT_SUCCESS;
 }
 
 void receiveFile(int clientSocket, const std::string &filename, int totalFileSize) {
@@ -128,20 +204,31 @@ void sendFile(int clientSocket, const std::string &filename, int offset = 0) {
 
 
 void handleUpload(int clientSocket, std::string command) {
-    std::cout << "Upload command received!" << std::endl;
-
     std::istringstream iss(command);
     std::string cmd, filename;
     int fileSize;
-
     if (!(iss >> cmd >> filename >> fileSize)) {
-        const char errorMSG[] = "ERROR: usage: UPLOAD <filename> <filesize>\n";
-        send(clientSocket, errorMSG, sizeof(errorMSG), 0);
+        sendMessage(clientSocket, "ERROR: Invalid UPLOAD command\n");
         return;
     }
 
-    std::cout << "Uploading file: " << filename << " (" << fileSize << " bytes)" << std::endl;
-    receiveFile(clientSocket, filename, fileSize);
+    // Создаем папку uploads, если её нет
+    if (!std::filesystem::exists("uploads")) {
+        std::filesystem::create_directory("uploads");
+    }
+
+    std::string filepath = "uploads/" + filename;
+    clientUploadMode[clientSocket] = true;
+    clientFileSizes[clientSocket] = fileSize;
+    clientFileName[clientSocket] = filename;
+
+    // Проверяем текущий размер файла
+    int currentSize = 0;
+    if (std::filesystem::exists(filepath)) {
+        currentSize = std::filesystem::file_size(filepath);
+    }
+
+    sendMessage(clientSocket, "READY " + std::to_string(currentSize) + "\n");
 }
 
 void handleDownload(int clientSocket, std::string command){
@@ -166,18 +253,43 @@ void handleDownload(int clientSocket, std::string command){
     sendFile(clientSocket, serverFilePath, offset);
 }
 
+void receiveFileData(int clientSocket, const char* data, int size) {
+    std::string filepath = "uploads/" + clientFileName[clientSocket];
+    std::ofstream file(filepath, std::ios::binary | std::ios::app);
+
+    if (!file) {
+        std::cerr << "Error opening file: " << filepath << std::endl;
+        sendMessage(clientSocket, "ERROR: Could not open file\n");
+        return;
+    }
+
+    file.write(data, size);
+    bytesReceivedMap[clientSocket] += size;
+
+    if (bytesReceivedMap[clientSocket] >= clientFileSizes[clientSocket]) {
+        clientUploadMode[clientSocket] = false;
+        sendMessage(clientSocket, "File upload complete.\n");
+        bytesReceivedMap.erase(clientSocket);
+    }
+}
+
 void handleClient(int clientSocket) {
     char buffer[BUFFER_SIZE];
     std::string receivedData;
+    clientUploadMode[clientSocket] = false;
     while (true) {
         memset(buffer, 0, BUFFER_SIZE);
         int bytesReceived = recv(clientSocket, buffer, BUFFER_SIZE - 1, 0);
-        if (bytesReceived <= 0) {
-            std::cout << "Client disconnected." << std::endl;
-            break;
+        if (bytesReceived <= 0) break;
+
+        if (clientUploadMode[clientSocket]) {
+            receiveFileData(clientSocket, buffer, bytesReceived);
+            continue;
         }
 
         receivedData.append(buffer, bytesReceived);
+
+
         size_t pos;
         while ((pos = receivedData.find('\n')) != std::string::npos) {
             std::string command = receivedData.substr(0, pos);
@@ -204,4 +316,7 @@ void handleClient(int clientSocket) {
             }
         }
     }
+    clientUploadMode.erase(clientSocket);
+    clientFileSizes.erase(clientSocket);
+    clientFileName.erase(clientSocket);
 }
